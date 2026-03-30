@@ -63,16 +63,44 @@ class CustomRNNLayer(nn.Module):
 
 
 class DecryptionModel(nn.Module):
-    def __init__(self, input_vocab_size: int, output_vocab_size: int, embedding_dim: int, hidden_size: int, dropout: float, cell_type: str):
+    def __init__(self, input_vocab_size: int, output_vocab_size: int, embedding_dim: int, hidden_size: int, dropout: float, cell_type: str, num_layers: int = 1, bidirectional: bool = False):
         super().__init__()
         self.embedding = nn.Embedding(input_vocab_size, embedding_dim)
-        self.rnn = CustomRNNLayer(embedding_dim, hidden_size, cell_type=cell_type)
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.cell_type = cell_type
+        
+        # Stack multiple RNN layers
+        self.rnns = nn.ModuleList()
+        input_dim = embedding_dim
+        for i in range(num_layers):
+            if bidirectional:
+                self.rnns.append(nn.ModuleDict({
+                    'fw': CustomRNNLayer(input_dim, hidden_size, cell_type=cell_type),
+                    'bw': CustomRNNLayer(input_dim, hidden_size, cell_type=cell_type)
+                }))
+                input_dim = hidden_size * 2
+            else:
+                self.rnns.append(CustomRNNLayer(input_dim, hidden_size, cell_type=cell_type))
+                input_dim = hidden_size
+        
         self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(hidden_size, output_vocab_size)
+        self.head = nn.Linear(input_dim, output_vocab_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         emb = self.embedding(x)
-        out, _ = self.rnn(emb)
+        out = emb
+        
+        for i, rnn_layer in enumerate(self.rnns):
+            if self.bidirectional:
+                fw_out, _ = rnn_layer['fw'](out)
+                bw_in = torch.flip(out, dims=[1])
+                bw_out, _ = rnn_layer['bw'](bw_in)
+                bw_out = torch.flip(bw_out, dims=[1])
+                out = torch.cat([fw_out, bw_out], dim=-1)
+            else:
+                out, _ = rnn_layer(out)
+        
         out = self.dropout(out)
         return self.head(out)
 
