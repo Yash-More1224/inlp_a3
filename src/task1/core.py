@@ -7,30 +7,29 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from src.common.config import load_config
-from src.common.data import PairDataset, build_vocab, chunk_pairs, read_cipher_tokens, read_plain_text, split_indices
+from src.common.data import PairDataset, build_vocab, chunk_pairs, read_cipher_word_tokens, read_plain_words, split_indices
 from src.common.io_utils import ensure_output_dirs, write_text
 from src.common.metrics import character_accuracy, levenshtein_distance, word_accuracy
 from src.common.models import DecryptionModel
 from src.common.seed import set_seed
 from src.utils.checkpoints import load_checkpoint, save_checkpoint
-from src.utils.hf_wandb import finish_wandb, init_wandb, log_wandb, push_to_hub
+from src.utils.hf_wandb import finish_wandb, init_wandb, log_wandb, push_to_hub, save_checkpoint_to_wandb
 
 
 def _prepare_data(config: dict):
     data_dir = config["data"]["data_dir"]
-    plain_text = read_plain_text(data_dir)
-    cipher_tokens = read_cipher_tokens("cipher_00.txt", data_dir)
+    plain_words = read_plain_words(data_dir)
+    cipher_tokens = read_cipher_word_tokens("cipher_00.txt", data_dir)
 
-    chars = list(plain_text)
-    n = min(len(chars), len(cipher_tokens))
-    chars = chars[:n]
+    n = min(len(plain_words), len(cipher_tokens))
+    plain_words = plain_words[:n]
     cipher_tokens = cipher_tokens[:n]
 
     cipher_vocab = build_vocab(cipher_tokens)
-    char_vocab = build_vocab(chars)
+    word_vocab = build_vocab(plain_words)
 
     x_ids = cipher_vocab.encode(cipher_tokens)
-    y_ids = char_vocab.encode(chars)
+    y_ids = word_vocab.encode(plain_words)
 
     seq_len = config["data"]["seq_len"]
     step = config["data"].get("step", seq_len)
@@ -45,7 +44,18 @@ def _prepare_data(config: dict):
     val_ds = PairDataset(slice_by_indices(x_chunks, val_idx), slice_by_indices(y_chunks, val_idx))
     test_ds = PairDataset(slice_by_indices(x_chunks, test_idx), slice_by_indices(y_chunks, test_idx))
 
-    return train_ds, val_ds, test_ds, cipher_vocab, char_vocab, plain_text
+    # Calculate token range for test data (word-level)
+    if test_idx:
+        test_start_token = test_idx[0] * seq_len
+        test_end_token = min((test_idx[-1] + 1) * seq_len, len(cipher_tokens))
+        test_cipher_tokens = cipher_tokens[test_start_token:test_end_token]
+        test_plain_words = plain_words[test_start_token:test_end_token]
+        test_plain_text = ' '.join(test_plain_words)
+    else:
+        test_cipher_tokens = []
+        test_plain_text = ''
+
+    return train_ds, val_ds, test_ds, cipher_vocab, word_vocab, plain_words, test_cipher_tokens, test_plain_text
 
 
 def _run_epoch(model, loader, criterion, optimizer, device):
@@ -72,21 +82,21 @@ def _run_epoch(model, loader, criterion, optimizer, device):
 
 
 @torch.no_grad()
-def _decode_text(model, cipher_tokens: list[str], cipher_vocab, char_vocab, seq_len: int, device: str):
+def _decode_text(model, cipher_tokens: list[str], cipher_vocab, word_vocab, seq_len: int, device: str):
     model.eval()
     ids = cipher_vocab.encode(cipher_tokens)
-    out_chars: list[str] = []
+    out_words: list[str] = []
 
-    for start in range(0, len(ids), seq_len):
+    for start in tqdm(range(0, len(ids), seq_len), desc="Decoding Text"):
         chunk = ids[start : start + seq_len]
         if not chunk:
             continue
         x = torch.tensor(chunk, dtype=torch.long, device=device).unsqueeze(0)
         logits = model(x)
         pred = logits.argmax(dim=-1).squeeze(0).tolist()
-        out_chars.extend(char_vocab.decode(pred, skip_special=False))
+        out_words.extend(word_vocab.decode(pred, skip_special=False))
 
-    return "".join(out_chars)
+    return " ".join(out_words)
 
 
 def run_task1(config_path: str, mode: str, cell_type: str) -> None:
@@ -98,7 +108,7 @@ def run_task1(config_path: str, mode: str, cell_type: str) -> None:
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
 
-    train_ds, val_ds, test_ds, cipher_vocab, char_vocab, plain_text = _prepare_data(config)
+    train_ds, val_ds, test_ds, cipher_vocab, word_vocab, plain_words, test_cipher_tokens, test_plain_text = _prepare_data(config)
 
     batch_size = int(config["training"]["batch_size"])
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
@@ -107,15 +117,30 @@ def run_task1(config_path: str, mode: str, cell_type: str) -> None:
 
     model = DecryptionModel(
         input_vocab_size=len(cipher_vocab.itos),
-        output_vocab_size=len(char_vocab.itos),
+        output_vocab_size=len(word_vocab.itos),
         embedding_dim=int(config["model"]["embedding_dim"]),
         hidden_size=int(config["model"]["hidden_size"]),
         dropout=float(config["model"]["dropout"]),
         cell_type=cell_type,
+        num_layers=int(config["model"].get("num_layers", 1)),
+        bidirectional=bool(config["model"].get("bidirectional", False)),
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(config["training"]["learning_rate"]))
+    optimizer = torch.optim.Adam(
+        model.parameters(), 
+        lr=float(config["training"]["learning_rate"]),
+        weight_decay=float(config["training"].get("weight_decay", 0.0))
+    )
     criterion = nn.CrossEntropyLoss()
+    
+    # Setup learning rate scheduler
+    scheduler = None
+    if "scheduler_step" in config["training"]:
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=int(config["training"]["scheduler_step"]),
+            gamma=float(config["training"].get("scheduler_gamma", 0.5))
+        )
 
     ckpt_path = config["output"]["checkpoint_path"]
     ckpt_path = ckpt_path.format(model=cell_type)
@@ -136,14 +161,23 @@ def run_task1(config_path: str, mode: str, cell_type: str) -> None:
         for epoch in range(1, epochs + 1):
             train_loss = _run_epoch(model, train_loader, criterion, optimizer, device)
             val_loss = _run_epoch(model, val_loader, criterion, optimizer=None, device=device)
+            current_lr = optimizer.param_groups[0]['lr']
+
+            print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | LR: {current_lr:.6f}", end="")
 
             if use_wandb:
-                log_wandb({"train_loss": train_loss, "val_loss": val_loss, "epoch": epoch}, step=epoch)
+                log_wandb({"train_loss": train_loss, "val_loss": val_loss, "epoch": epoch, "lr": current_lr}, step=epoch)
 
             if val_loss < best_val:
                 best_val = val_loss
                 best_epoch = epoch
                 save_checkpoint(model, optimizer, epoch, val_loss, ckpt_path)
+                print(" ✓ (checkpoint saved)")
+            else:
+                print()
+
+            if scheduler is not None:
+                scheduler.step()
 
         summary_path = Path(output_dirs["logs"]) / f"task1_{cell_type}_train_summary.txt"
         write_text(str(summary_path), f"best_epoch={best_epoch}\nbest_val_loss={best_val:.6f}\n")
@@ -160,15 +194,28 @@ def run_task1(config_path: str, mode: str, cell_type: str) -> None:
         load_checkpoint(ckpt_path, model, optimizer=None, device=device)
         test_loss = _run_epoch(model, test_loader, criterion, optimizer=None, device=device)
 
-        cipher_tokens = read_cipher_tokens("cipher_00.txt", config["data"]["data_dir"])
-        pred_text = _decode_text(model, cipher_tokens, cipher_vocab, char_vocab, int(config["data"]["seq_len"]), device)
+        print("Decoding test data...")
+        # Use only the test portion for evaluation metrics
+        pred_text = _decode_text(model, test_cipher_tokens, cipher_vocab, word_vocab, int(config["data"]["seq_len"]), device)
 
-        target_text = plain_text[: len(pred_text)]
+        print("Computing metrics...")
+        # Use test plain text for comparison
+        target_text = test_plain_text
+        
+        print("  - Computing character accuracy...")
+        char_acc = character_accuracy(pred_text, target_text)
+        
+        print("  - Computing word accuracy...")
+        word_acc = word_accuracy(pred_text, target_text)
+        
+        print("  - Computing Levenshtein distance (this may take a minute)...")
+        lev_dist = float(levenshtein_distance(pred_text, target_text))
+
         metrics = {
             "test_loss": test_loss,
-            "char_accuracy": character_accuracy(pred_text, target_text),
-            "word_accuracy": word_accuracy(pred_text, target_text),
-            "levenshtein": float(levenshtein_distance(pred_text, target_text)),
+            "char_accuracy": char_acc,
+            "word_accuracy": word_acc,
+            "levenshtein": lev_dist,
         }
 
         if use_wandb:
